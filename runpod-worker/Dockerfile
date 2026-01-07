@@ -1,7 +1,8 @@
-FROM runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04
+FROM runpod/pytorch:2.1.0-cuda12.1.0-runtime
 
-# instalar ffmpeg (OBLIGATORIO)
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install -y ffmpeg && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -10,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY handler.py .
 
-CMD ["python", "handler.py"]
+CMD ["python", "-u", "handler.py"]
