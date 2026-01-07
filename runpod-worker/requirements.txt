@@ -1,4 +1,4 @@
 faster-whisper
 torch
 numpy
-
+runpod
