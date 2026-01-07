@@ -1,9 +1,9 @@
 import base64
 import tempfile
 import os
+import runpod
 from faster_whisper import WhisperModel
 
-# carga modelo (medium por ahora)
 model = WhisperModel(
     "medium",
     device="cuda",
@@ -11,9 +11,7 @@ model = WhisperModel(
 )
 
 def handler(event):
-    # audio en base64 desde Render
     audio_b64 = event["input"]["audio_base64"]
-
     audio_bytes = base64.b64decode(audio_b64)
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -40,3 +38,5 @@ def handler(event):
         "language": info.language,
         "words": words
     }
+
+runpod.serverless.start({"handler": handler})
