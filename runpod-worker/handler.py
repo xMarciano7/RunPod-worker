@@ -1,77 +1,80 @@
-import runpod
-import tempfile
-import subprocess
 import os
-import base64
-from faster_whisper import WhisperModel
+import uuid
+import subprocess
+import tempfile
+import requests
+import runpod
+from pathlib import Path
 
-model = WhisperModel(
-    "medium",
-    device="cuda",
-    compute_type="float16"
-)
+WHISPER_MODEL = "medium"
 
-def handler(event):
-    # 1. Recibir vídeo en base64
-    video_b64 = event["input"]["video_base64"]
-    video_bytes = base64.b64decode(video_b64)
+def download_video(video_url: str, dst_path: str):
+    r = requests.get(video_url, stream=True, timeout=30)
+    r.raise_for_status()
 
-    # 2. Guardar vídeo temporal
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
-        vf.write(video_bytes)
-        video_path = vf.name
+    with open(dst_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
 
-    audio_path = video_path.replace(".mp4", ".wav")
-    output_video_path = video_path.replace(".mp4", "_out.mp4")
+    if not os.path.exists(dst_path) or os.path.getsize(dst_path) < 1024 * 100:
+        raise RuntimeError("Downloaded video is empty or invalid")
 
-    # 3. Extraer audio (FFmpeg)
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-vn",
-            "-ac", "1",
-            "-ar", "16000",
-            audio_path
-        ],
-        check=True
-    )
+def validate_video(path: str):
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 4. Whisper
-    segments, info = model.transcribe(
+def extract_audio(video_path: str, audio_path: str):
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", video_path,
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        audio_path
+    ]
+    subprocess.run(cmd, check=True)
+
+def run_whisper(audio_path: str):
+    cmd = [
+        "faster-whisper",
         audio_path,
-        word_timestamps=True
-    )
+        "--model", WHISPER_MODEL,
+        "--output_format", "json"
+    ]
+    subprocess.run(cmd, check=True)
 
-    words = []
-    for seg in segments:
-        for w in seg.words:
-            words.append({
-                "start": w.start,
-                "end": w.end,
-                "word": w.word
-            })
+def handler(job):
+    try:
+        video_url = job["input"].get("video_url")
+        if not video_url:
+            raise ValueError("Missing video_url")
 
-    # 5. (TEMPORAL) copiar vídeo como resultado final
-    # 👉 aquí luego quemas subtítulos con ASS
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path, "-c", "copy", output_video_path],
-        check=True
-    )
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = os.path.join(tmp, "input.mp4")
+            audio_path = os.path.join(tmp, "audio.wav")
 
-    # 6. Devolver vídeo final en base64
-    with open(output_video_path, "rb") as f:
-        output_b64 = base64.b64encode(f.read()).decode("utf-8")
+            download_video(video_url, video_path)
+            validate_video(video_path)
+            extract_audio(video_path, audio_path)
+            run_whisper(audio_path)
 
-    # 7. Limpieza
-    os.remove(video_path)
-    os.remove(audio_path)
-    os.remove(output_video_path)
+        return {
+            "status": "ok"
+        }
 
-    return {
-        "language": info.language,
-        "words": words,
-        "video_base64": output_b64
-    }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
 
 runpod.serverless.start({"handler": handler})
