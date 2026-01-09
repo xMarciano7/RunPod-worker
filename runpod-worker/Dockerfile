@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -17,7 +17,7 @@ RUN ln -s /usr/bin/python3 /usr/bin/python
 
 WORKDIR /app
 
-# Torch CUDA (estable)
+# PyTorch CUDA 12.1 (compatible con cuDNN 8)
 RUN pip install --upgrade pip && \
     pip install torch --index-url https://download.pytorch.org/whl/cu121
 
