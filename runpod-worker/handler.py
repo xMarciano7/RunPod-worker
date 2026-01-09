@@ -9,6 +9,7 @@ from runpod.serverless import start
 from faster_whisper import WhisperModel
 
 
+# ================= CONFIG =================
 WHISPER_MODEL = "tiny"
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
@@ -20,6 +21,7 @@ R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_PUBLIC_BASE = os.getenv("R2_PUBLIC_BASE")
+# =========================================
 
 
 def run(cmd):
@@ -66,6 +68,25 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.write(header + "\n".join(lines))
 
 
+def download_video(url, output_path):
+    if "youtube.com" in url or "youtu.be" in url:
+        run([
+            "yt-dlp",
+            "-f", "mp4",
+            "-o", output_path,
+            url
+        ])
+    else:
+        run([
+            "curl",
+            "-L",
+            "--fail",
+            url,
+            "-o",
+            output_path
+        ])
+
+
 def handler(event):
     try:
         video_url = event["input"]["video_url"]
@@ -78,12 +99,12 @@ def handler(event):
         output_mp4 = os.path.join(tmp, "output.mp4")
 
         # DOWNLOAD
-        run(["curl", "-L", "--fail", video_url, "-o", input_mp4])
+        download_video(video_url, input_mp4)
 
-        # VALIDATE MP4
+        # VALIDATE VIDEO
         run(["ffprobe", "-v", "error", "-show_format", input_mp4])
 
-        # AUDIO
+        # AUDIO (RECORTADO)
         run([
             "ffmpeg", "-y",
             "-i", input_mp4,
@@ -93,6 +114,7 @@ def handler(event):
             audio_wav
         ])
 
+        # WHISPER
         model = WhisperModel(
             WHISPER_MODEL,
             device=DEVICE,
@@ -114,8 +136,10 @@ def handler(event):
         if not words:
             raise RuntimeError("NO WORDS FROM WHISPER")
 
+        # ASS
         generate_ass(words, subs_ass)
 
+        # BURN
         run([
             "ffmpeg", "-y",
             "-i", input_mp4,
@@ -124,6 +148,7 @@ def handler(event):
             output_mp4
         ])
 
+        # UPLOAD R2
         s3 = boto3.client(
             "s3",
             endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
@@ -133,7 +158,12 @@ def handler(event):
         )
 
         key = f"clips/{uuid.uuid4()}.mp4"
-        s3.upload_file(output_mp4, R2_BUCKET, key, ExtraArgs={"ContentType": "video/mp4"})
+        s3.upload_file(
+            output_mp4,
+            R2_BUCKET,
+            key,
+            ExtraArgs={"ContentType": "video/mp4"}
+        )
 
         return {"video_url": f"{R2_PUBLIC_BASE}/{key}"}
 

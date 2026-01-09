@@ -4,3 +4,4 @@ torch
 numpy
 runpod
 boto3
+yt-dlp
