@@ -3,142 +3,118 @@ import json
 import uuid
 import subprocess
 import requests
-import boto3
 from runpod.serverless import start
 
-# =============================
-# CONFIG
-# =============================
+TMP = "/tmp"
 
-TMP_DIR = "/tmp"
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
-
-R2_ENDPOINT = os.getenv("R2_ENDPOINT")
-R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
-R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
-R2_BUCKET = os.getenv("R2_BUCKET")
-
-s3 = boto3.client(
-    "s3",
-    endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY,
-    aws_secret_access_key=R2_SECRET_KEY,
-)
-
-# =============================
-# UTILS
-# =============================
-
-def download_file(url, out_path):
-    with requests.get(url, stream=True, timeout=300) as r:
-        r.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-
-def upload_r2(local_path, key):
-    s3.upload_file(local_path, R2_BUCKET, key)
-    return f"{R2_ENDPOINT}/{R2_BUCKET}/{key}"
-
-def run_cmd(cmd):
+def run(cmd):
     subprocess.run(cmd, check=True)
 
-# =============================
-# MAIN HANDLER
-# =============================
+def sh(cmd):
+    return subprocess.check_output(cmd).decode()
 
-def handler(job):
-    job_id = job["id"]
-    data = job["input"]
+def download_video(url, out_mp4):
+    tmp = out_mp4 + ".tmp"
 
-    video_url = data["video_url"]
+    if "youtube.com" in url or "youtu.be" in url:
+        run([
+            "yt-dlp",
+            "-f", "bv*+ba/b",
+            "-o", tmp,
+            url
+        ])
+    else:
+        with requests.get(url, stream=True, timeout=600) as r:
+            r.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
 
-    work_id = str(uuid.uuid4())
+    if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024 * 100:
+        raise RuntimeError("download failed or empty")
 
-    video_path = f"{TMP_DIR}/input_{work_id}.mp4"
-    audio_path = f"{TMP_DIR}/audio_{work_id}.wav"
-    whisper_json = f"{TMP_DIR}/whisper_{work_id}.json"
-    ass_path = f"{TMP_DIR}/subs_{work_id}.ass"
-    output_video = f"{TMP_DIR}/final_{work_id}.mp4"
+    # validar mp4
+    run(["ffprobe", "-v", "error", tmp])
 
-    # =============================
-    # 1. DOWNLOAD VIDEO
-    # =============================
-    download_file(video_url, video_path)
+    os.rename(tmp, out_mp4)
 
-    # =============================
-    # 2. EXTRACT AUDIO
-    # =============================
-    run_cmd([
+def extract_audio(mp4, wav):
+    run([
         "ffmpeg", "-y",
-        "-i", video_path,
+        "-i", mp4,
         "-ac", "1",
         "-ar", "16000",
-        audio_path
+        wav
     ])
 
-    # =============================
-    # 3. TRANSCRIBE (NO CLI)
-    # =============================
-    from faster_whisper import WhisperModel
+def whisper(audio, out_json):
+    run([
+        "python", "-m", "faster_whisper",
+        audio,
+        "--model", "medium",
+        "--output_format", "json",
+        "--output_dir", os.path.dirname(out_json)
+    ])
 
-    model = WhisperModel(
-        WHISPER_MODEL,
-        device="cuda",
-        compute_type="float16"
-    )
+def json_to_ass(json_path, ass_path):
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    segments, info = model.transcribe(
-        audio_path,
-        word_timestamps=True
-    )
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write("[Script Info]\n")
+        f.write("ScriptType: v4.00+\n\n")
+        f.write("[V4+ Styles]\n")
+        f.write("Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BorderStyle,Outline,Alignment\n")
+        f.write("Style: Default,Poppins ExtraBold,130,&H00FFFFFF,&H00000000,1,4,2\n\n")
+        f.write("[Events]\n")
+        f.write("Format: Start,End,Style,Text\n")
 
-    words = []
-    for seg in segments:
-        for w in seg.words:
-            words.append({
-                "start": w.start,
-                "end": w.end,
-                "word": w.word
-            })
+        for s in data["segments"]:
+            start = s["start"]
+            end = s["end"]
+            text = s["text"].strip().replace("\n", " ")
+            f.write(
+                f"Dialogue: 0,{sec(start)},{sec(end)},Default,{text}\n"
+            )
 
-    with open(whisper_json, "w", encoding="utf-8") as f:
-        json.dump(words, f, ensure_ascii=False)
+def sec(t):
+    h = int(t // 3600)
+    m = int((t % 3600) // 60)
+    s = t % 60
+    return f"{h}:{m:02d}:{s:05.2f}"
 
-    # =============================
-    # 4. BUILD ASS (FULL LENGTH)
-    # =============================
-    subprocess.run([
-        "python",
-        "handler_merge_ass.py",
-        whisper_json,
-        ass_path
-    ], check=True)
+def burn(mp4, ass, out):
+    run([
+        "ffmpeg", "-y",
+        "-i", mp4,
+        "-vf", f"ass={ass}",
+        "-c:a", "copy",
+        out
+    ])
 
-    # =============================
-    # 5. BURN SUBTITLES
-    # =============================
-    subprocess.run([
-        "python",
-        "handler_burn_final.py",
-        video_path,
-        ass_path,
-        output_video
-    ], check=True)
+def handler(job):
+    url = job["input"].get("video_url")
+    if not url:
+        raise RuntimeError("video_url missing")
 
-    # =============================
-    # 6. UPLOAD RESULT
-    # =============================
-    r2_key = f"clips/{job_id}.mp4"
-    final_url = upload_r2(output_video, r2_key)
+    jid = str(uuid.uuid4())
+
+    mp4 = f"{TMP}/input_{jid}.mp4"
+    wav = f"{TMP}/audio_{jid}.wav"
+    jsn = f"{TMP}/audio_{jid}.json"
+    ass = f"{TMP}/subs_{jid}.ass"
+    out = f"{TMP}/clip_{jid}.mp4"
+
+    download_video(url, mp4)
+    extract_audio(mp4, wav)
+    whisper(wav, jsn)
+    json_to_ass(jsn, ass)
+    burn(mp4, ass, out)
 
     return {
-        "status": "completed",
-        "video_url": final_url
+        "status": "ok",
+        "local_path": out
     }
-
-# =============================
-# START SERVERLESS
-# =============================
 
 start({"handler": handler})
