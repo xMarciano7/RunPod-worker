@@ -1,108 +1,144 @@
-from faster_whisper import WhisperModel
 import os
-import subprocess
-import tempfile
 import json
-import runpod
+import uuid
+import subprocess
+import requests
 import boto3
-from botocore.client import Config
+from runpod.serverless import start
 
-WHISPER_MODEL = "medium"
+# =============================
+# CONFIG
+# =============================
 
-R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
-R2_ACCESS_KEY = os.environ["R2_ACCESS_KEY"]
-R2_SECRET_KEY = os.environ["R2_SECRET_KEY"]
-R2_BUCKET = os.environ["R2_BUCKET"]
-R2_PUBLIC_BASE = os.environ["R2_PUBLIC_BASE"]
+TMP_DIR = "/tmp"
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
+
+R2_ENDPOINT = os.getenv("R2_ENDPOINT")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+R2_BUCKET = os.getenv("R2_BUCKET")
 
 s3 = boto3.client(
     "s3",
-    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+    endpoint_url=R2_ENDPOINT,
     aws_access_key_id=R2_ACCESS_KEY,
     aws_secret_access_key=R2_SECRET_KEY,
-    config=Config(signature_version="s3v4"),
-    region_name="auto",
 )
 
-def run(cmd):
-    subprocess.run(cmd, check=True)
+# =============================
+# UTILS
+# =============================
 
-def download(url, out):
-    run(["yt-dlp", "-f", "mp4/best", "-o", out, url])
-
-def cut_clip(inp, out):
-    run(["ffmpeg", "-y", "-i", inp, "-t", "75", "-c", "copy", out])
-
-def extract_audio(video, audio):
-    run(["ffmpeg", "-y", "-i", video, "-vn", "-ac", "1", "-ar", "16000", audio])
-
-def whisper(audio_path, out_json):
-    model = WhisperModel(WHISPER_MODEL, compute_type="int8")
-    segments, _ = model.transcribe(audio_path, word_timestamps=True)
-
-    data = {"segments": []}
-    for seg in segments:
-        data["segments"].append({
-            "start": seg.start,
-            "end": seg.end,
-            "text": seg.text,
-            "words": [
-                {"word": w.word, "start": w.start, "end": w.end}
-                for w in (seg.words or [])
-            ]
-        })
-
-    with open(out_json, "w", encoding="utf8") as f:
-        json.dump(data, f)
-
-def make_ass(words, ass):
-    with open(ass, "w", encoding="utf8") as f:
-        f.write("""[Script Info]
-ScriptType: v4.00+
-
-[V4+ Styles]
-Style: Default,Poppins ExtraBold,80,&H00FFFFFF,&H00000000,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,6,0,2,10,10,40,1
-
-[Events]
-""")
-        for w in words:
-            s, e, t = w["start"], w["end"], w["word"]
-            f.write(
-                f"Dialogue: 0,0:{int(s//60):02}:{s%60:05.2f},0:{int(e//60):02}:{e%60:05.2f},Default,,0,0,0,,{t}\n"
-            )
-
-def burn(video, ass, out):
-    run(["ffmpeg", "-y", "-i", video, "-vf", f"ass={ass}", "-c:a", "copy", out])
+def download_file(url, out_path):
+    with requests.get(url, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
 
 def upload_r2(local_path, key):
     s3.upload_file(local_path, R2_BUCKET, key)
-    return f"{R2_PUBLIC_BASE}/{key}"
+    return f"{R2_ENDPOINT}/{R2_BUCKET}/{key}"
+
+def run_cmd(cmd):
+    subprocess.run(cmd, check=True)
+
+# =============================
+# MAIN HANDLER
+# =============================
 
 def handler(job):
-    video_url = job["input"]["video_url"]
     job_id = job["id"]
+    data = job["input"]
 
-    with tempfile.TemporaryDirectory() as tmp:
-        raw = f"{tmp}/raw.mp4"
-        clip = f"{tmp}/clip.mp4"
-        audio = f"{tmp}/audio.wav"
-        ass = f"{tmp}/sub.ass"
-        final = f"{tmp}/final.mp4"
-        transcript = f"{tmp}/audio.json"
+    video_url = data["video_url"]
 
-        download(video_url, raw)
-        cut_clip(raw, clip)
-        extract_audio(clip, audio)
-        whisper(audio, transcript)
+    work_id = str(uuid.uuid4())
 
-        data = json.load(open(transcript))
-        words = data["segments"][0]["words"] if data["segments"] else []
-        make_ass(words, ass)
-        burn(clip, ass, final)
+    video_path = f"{TMP_DIR}/input_{work_id}.mp4"
+    audio_path = f"{TMP_DIR}/audio_{work_id}.wav"
+    whisper_json = f"{TMP_DIR}/whisper_{work_id}.json"
+    ass_path = f"{TMP_DIR}/subs_{work_id}.ass"
+    output_video = f"{TMP_DIR}/final_{work_id}.mp4"
 
-        key = f"clips/{job_id}.mp4"
-        url = upload_r2(final, key)
+    # =============================
+    # 1. DOWNLOAD VIDEO
+    # =============================
+    download_file(video_url, video_path)
 
-        return {"video_url": url}
+    # =============================
+    # 2. EXTRACT AUDIO
+    # =============================
+    run_cmd([
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-ac", "1",
+        "-ar", "16000",
+        audio_path
+    ])
 
-runpod.serverless.start({"handler": handler})
+    # =============================
+    # 3. TRANSCRIBE (NO CLI)
+    # =============================
+    from faster_whisper import WhisperModel
+
+    model = WhisperModel(
+        WHISPER_MODEL,
+        device="cuda",
+        compute_type="float16"
+    )
+
+    segments, info = model.transcribe(
+        audio_path,
+        word_timestamps=True
+    )
+
+    words = []
+    for seg in segments:
+        for w in seg.words:
+            words.append({
+                "start": w.start,
+                "end": w.end,
+                "word": w.word
+            })
+
+    with open(whisper_json, "w", encoding="utf-8") as f:
+        json.dump(words, f, ensure_ascii=False)
+
+    # =============================
+    # 4. BUILD ASS (FULL LENGTH)
+    # =============================
+    subprocess.run([
+        "python",
+        "handler_merge_ass.py",
+        whisper_json,
+        ass_path
+    ], check=True)
+
+    # =============================
+    # 5. BURN SUBTITLES
+    # =============================
+    subprocess.run([
+        "python",
+        "handler_burn_final.py",
+        video_path,
+        ass_path,
+        output_video
+    ], check=True)
+
+    # =============================
+    # 6. UPLOAD RESULT
+    # =============================
+    r2_key = f"clips/{job_id}.mp4"
+    final_url = upload_r2(output_video, r2_key)
+
+    return {
+        "status": "completed",
+        "video_url": final_url
+    }
+
+# =============================
+# START SERVERLESS
+# =============================
+
+start({"handler": handler})
