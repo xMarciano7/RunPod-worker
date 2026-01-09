@@ -20,6 +20,7 @@ def download_video(url, out_mp4):
         run([
             "yt-dlp",
             "-f", "bv*+ba/b",
+            "--merge-output-format", "mp4",
             "-o", tmp,
             url
         ])
@@ -31,13 +32,26 @@ def download_video(url, out_mp4):
                     if chunk:
                         f.write(chunk)
 
-    if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024 * 100:
+    # esperar a que el archivo sea estable
+    for _ in range(10):
+        if os.path.exists(tmp) and os.path.getsize(tmp) > 1024 * 500:
+            break
+        time.sleep(1)
+
+    if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024 * 500:
         raise RuntimeError("download failed or empty")
 
-    # validar mp4
-    run(["ffprobe", "-v", "error", tmp])
+    # validar MP4 real
+    run([
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name",
+        tmp
+    ])
 
     os.rename(tmp, out_mp4)
+
+
 
 def extract_audio(mp4, wav):
     run([
