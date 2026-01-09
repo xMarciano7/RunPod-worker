@@ -1,4 +1,4 @@
-faster-whisper
+faster-whisper[cli]
 torch
 numpy
 runpod
