@@ -1,3 +1,4 @@
+from faster_whisper import WhisperModel
 import os
 import subprocess
 import tempfile
@@ -32,15 +33,28 @@ def extract_audio(video, audio):
         audio
     ])
 
-def whisper(audio, out_json):
-    run([
-        "python", "-m", "faster_whisper",
-        audio,
-        "--model", WHISPER_MODEL,
-        "--output_format", "json",
-        "--output_dir", os.path.dirname(out_json)
-    ])
+def whisper(audio_path, out_json):
+    model = WhisperModel(WHISPER_MODEL, compute_type="int8")
+    segments, info = model.transcribe(audio_path, word_timestamps=True)
 
+    data = {"segments": []}
+
+    for seg in segments:
+        data["segments"].append({
+            "start": seg.start,
+            "end": seg.end,
+            "text": seg.text,
+            "words": [
+                {
+                    "word": w.word,
+                    "start": w.start,
+                    "end": w.end
+                } for w in (seg.words or [])
+            ]
+        })
+
+    with open(out_json, "w", encoding="utf8") as f:
+        json.dump(data, f)
 
 def make_ass(words, ass):
     with open(ass, "w", encoding="utf8") as f:
@@ -78,14 +92,15 @@ def handler(job):
         audio = f"{tmp}/audio.wav"
         ass = f"{tmp}/sub.ass"
         final = f"{tmp}/final.mp4"
+        transcript = f"{tmp}/audio.json"
 
         download(video_url, raw)
         cut_clip(raw, clip)
         extract_audio(clip, audio)
-        whisper(audio, tmp)
+        whisper(audio, transcript)
 
-        data = json.load(open(f"{tmp}/audio.json"))
-        words = data["segments"][0]["words"]
+        data = json.load(open(transcript))
+        words = data["segments"][0]["words"] if data["segments"] else []
         make_ass(words, ass)
         burn(clip, ass, final)
 
