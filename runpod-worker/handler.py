@@ -1,98 +1,96 @@
 import os
 import subprocess
 import tempfile
-import requests
+import base64
+import json
 import runpod
 
 WHISPER_MODEL = "medium"
 
-def download_video_http(video_url: str, dst_path: str):
-    r = requests.get(video_url, stream=True, timeout=60)
-    r.raise_for_status()
-
-    with open(dst_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
-
-    if not os.path.exists(dst_path) or os.path.getsize(dst_path) < 1024 * 100:
-        raise RuntimeError("Downloaded video is empty or invalid")
-
-def download_video_ytdlp(video_url: str, dst_path: str):
-    cmd = [
-        "yt-dlp",
-        "-f", "mp4/best",
-        "-o", dst_path,
-        video_url
-    ]
+def run(cmd):
     subprocess.run(cmd, check=True)
 
-    if not os.path.exists(dst_path) or os.path.getsize(dst_path) < 1024 * 100:
-        raise RuntimeError("yt-dlp download failed")
+def download(video_url, out):
+    run(["yt-dlp", "-f", "mp4/best", "-o", out, video_url])
 
-def validate_video(path: str):
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def cut_clip(inp, out):
+    run([
+        "ffmpeg", "-y",
+        "-i", inp,
+        "-t", "75",
+        "-c", "copy",
+        out
+    ])
 
-def extract_audio(video_path: str, audio_path: str):
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", video_path,
+def extract_audio(video, audio):
+    run([
+        "ffmpeg", "-y",
+        "-i", video,
         "-vn",
         "-ac", "1",
         "-ar", "16000",
-        audio_path
-    ]
-    subprocess.run(cmd, check=True)
+        audio
+    ])
 
-def run_whisper(audio_path: str):
-    cmd = [
-        "faster-whisper",
-        audio_path,
+def whisper(audio, out_json):
+    run([
+        "faster-whisper", audio,
         "--model", WHISPER_MODEL,
-        "--output_format", "json"
-    ]
-    subprocess.run(cmd, check=True)
+        "--output_format", "json",
+        "--output_dir", os.path.dirname(out_json)
+    ])
+
+def make_ass(words, ass):
+    with open(ass, "w", encoding="utf8") as f:
+        f.write("""[Script Info]
+ScriptType: v4.00+
+
+[V4+ Styles]
+Style: Default,Poppins ExtraBold,80,&H00FFFFFF,&H00000000,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,6,0,2,10,10,40,1
+
+[Events]
+""")
+        for w in words:
+            s = w["start"]
+            e = w["end"]
+            t = w["word"]
+            f.write(
+                f"Dialogue: 0,0:{int(s//60):02}:{s%60:05.2f},0:{int(e//60):02}:{e%60:05.2f},Default,,0,0,0,,{t}\n"
+            )
+
+def burn(video, ass, out):
+    run([
+        "ffmpeg", "-y",
+        "-i", video,
+        "-vf", f"ass={ass}",
+        "-c:a", "copy",
+        out
+    ])
 
 def handler(job):
-    try:
-        video_url = job["input"].get("video_url")
-        if not video_url:
-            raise ValueError("Missing video_url")
+    video_url = job["input"]["video_url"]
 
-        with tempfile.TemporaryDirectory() as tmp:
-            video_path = os.path.join(tmp, "input.mp4")
-            audio_path = os.path.join(tmp, "audio.wav")
+    with tempfile.TemporaryDirectory() as tmp:
+        raw = f"{tmp}/raw.mp4"
+        clip = f"{tmp}/clip.mp4"
+        audio = f"{tmp}/audio.wav"
+        ass = f"{tmp}/sub.ass"
+        final = f"{tmp}/final.mp4"
 
-            # YouTube / streaming → yt-dlp
-            if "youtube.com" in video_url or "youtu.be" in video_url:
-                download_video_ytdlp(video_url, video_path)
-            else:
-                # intenta HTTP normal primero
-                try:
-                    download_video_http(video_url, video_path)
-                except Exception:
-                    # fallback a yt-dlp para cualquier URL rara
-                    download_video_ytdlp(video_url, video_path)
+        download(video_url, raw)
+        cut_clip(raw, clip)
+        extract_audio(clip, audio)
+        whisper(audio, tmp)
 
-            validate_video(video_path)
-            extract_audio(video_path, audio_path)
-            run_whisper(audio_path)
+        data = json.load(open(f"{tmp}/audio.json"))
+        words = data["segments"][0]["words"]
+        make_ass(words, ass)
+        burn(clip, ass, final)
 
-        return {"status": "ok"}
+        b64 = base64.b64encode(open(final, "rb").read()).decode()
 
-    except Exception as e:
         return {
-            "status": "error",
-            "error": str(e)
+            "video_base64": b64
         }
 
 runpod.serverless.start({"handler": handler})
