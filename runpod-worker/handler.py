@@ -34,11 +34,13 @@ def extract_audio(video, audio):
 
 def whisper(audio, out_json):
     run([
-        "faster-whisper", audio,
+        "python", "-m", "faster_whisper",
+        audio,
         "--model", WHISPER_MODEL,
         "--output_format", "json",
         "--output_dir", os.path.dirname(out_json)
     ])
+
 
 def make_ass(words, ass):
     with open(ass, "w", encoding="utf8") as f:
