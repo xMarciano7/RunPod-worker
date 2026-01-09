@@ -1,135 +1,159 @@
 import os
-import time
-import json
-import uuid
 import subprocess
-import requests
-from runpod.serverless import start
+import tempfile
+import traceback
+import uuid
 
-TMP = "/tmp"
+import boto3
+from runpod.serverless import start
+from faster_whisper import WhisperModel
+
+
+# ================= CONFIG =================
+WHISPER_MODEL = "tiny"
+DEVICE = "cuda"
+COMPUTE_TYPE = "float16"
+FONT_NAME = "Liberation Sans"
+MAX_DURATION = "75"
+
+R2_BUCKET = os.getenv("R2_BUCKET")
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+R2_PUBLIC_BASE = os.getenv("R2_PUBLIC_BASE")  # ej: https://cdn.tudominio.com
+# =========================================
+
 
 def run(cmd):
-    subprocess.run(cmd, check=True)
-
-def sh(cmd):
-    return subprocess.check_output(cmd).decode()
-
-def download_video(url, out_mp4):
-    tmp = out_mp4 + ".tmp"
-
-    if "youtube.com" in url or "youtu.be" in url:
-        run([
-            "yt-dlp",
-            "-f", "bv*+ba/b",
-            "--merge-output-format", "mp4",
-            "-o", tmp,
-            url
-        ])
-    else:
-        with requests.get(url, stream=True, timeout=600) as r:
-            r.raise_for_status()
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-
-    # esperar a que el archivo sea estable
-    for _ in range(10):
-        if os.path.exists(tmp) and os.path.getsize(tmp) > 1024 * 500:
-            break
-        time.sleep(1)
-
-    if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024 * 500:
-        raise RuntimeError("download failed or empty")
-
-    # validar MP4 real
-    run([
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name",
-        tmp
-    ])
-
-    os.rename(tmp, out_mp4)
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"CMD FAILED:\n{' '.join(cmd)}\n\nSTDERR:\n{p.stderr}"
+        )
+    return p.stdout
 
 
-
-def extract_audio(mp4, wav):
-    run([
-        "ffmpeg", "-y",
-        "-i", mp4,
-        "-ac", "1",
-        "-ar", "16000",
-        wav
-    ])
-
-def whisper(audio, out_json):
-    run([
-        "python", "-m", "faster_whisper",
-        audio,
-        "--model", "medium",
-        "--output_format", "json",
-        "--output_dir", os.path.dirname(out_json)
-    ])
-
-def json_to_ass(json_path, ass_path):
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    with open(ass_path, "w", encoding="utf-8") as f:
-        f.write("[Script Info]\n")
-        f.write("ScriptType: v4.00+\n\n")
-        f.write("[V4+ Styles]\n")
-        f.write("Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BorderStyle,Outline,Alignment\n")
-        f.write("Style: Default,Poppins ExtraBold,130,&H00FFFFFF,&H00000000,1,4,2\n\n")
-        f.write("[Events]\n")
-        f.write("Format: Start,End,Style,Text\n")
-
-        for s in data["segments"]:
-            start = s["start"]
-            end = s["end"]
-            text = s["text"].strip().replace("\n", " ")
-            f.write(
-                f"Dialogue: 0,{sec(start)},{sec(end)},Default,{text}\n"
-            )
-
-def sec(t):
+def ts(t):
     h = int(t // 3600)
     m = int((t % 3600) // 60)
     s = t % 60
     return f"{h}:{m:02d}:{s:05.2f}"
 
-def burn(mp4, ass, out):
-    run([
-        "ffmpeg", "-y",
-        "-i", mp4,
-        "-vf", f"ass={ass}",
-        "-c:a", "copy",
-        out
-    ])
 
-def handler(job):
-    url = job["input"].get("video_url")
-    if not url:
-        raise RuntimeError("video_url missing")
+def generate_ass(words, path):
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
 
-    jid = str(uuid.uuid4())
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{FONT_NAME},130,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,1,0,1,6,0,2,80,80,260,1
 
-    mp4 = f"{TMP}/input_{jid}.mp4"
-    wav = f"{TMP}/audio_{jid}.wav"
-    jsn = f"{TMP}/audio_{jid}.json"
-    ass = f"{TMP}/subs_{jid}.ass"
-    out = f"{TMP}/clip_{jid}.mp4"
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    lines = []
+    for w in words:
+        lines.append(
+            f"Dialogue: 0,{ts(w['start'])},{ts(w['end'])},Default,,0,0,0,,{w['word'].upper()}"
+        )
 
-    download_video(url, mp4)
-    extract_audio(mp4, wav)
-    whisper(wav, jsn)
-    json_to_ass(jsn, ass)
-    burn(mp4, ass, out)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(header + "\n".join(lines))
 
-    return {
-        "status": "ok",
-        "local_path": out
-    }
+
+def handler(event):
+    try:
+        video_url = event["input"]["video_url"]
+
+        tmp = tempfile.mkdtemp()
+        input_mp4 = os.path.join(tmp, "input.mp4")
+        audio_wav = os.path.join(tmp, "audio.wav")
+        subs_ass = os.path.join(tmp, "subs.ass")
+        output_mp4 = os.path.join(tmp, "output.mp4")
+
+        # DOWNLOAD
+        run(["curl", "-L", video_url, "-o", input_mp4])
+
+        # AUDIO
+        run([
+            "ffmpeg", "-y",
+            "-i", input_mp4,
+            "-t", MAX_DURATION,
+            "-ac", "1",
+            "-ar", "16000",
+            audio_wav
+        ])
+
+        # WHISPER
+        model = WhisperModel(
+            WHISPER_MODEL,
+            device=DEVICE,
+            compute_type=COMPUTE_TYPE
+        )
+
+        segments, _ = model.transcribe(audio_wav, word_timestamps=True)
+
+        words = []
+        for seg in segments:
+            if seg.words:
+                for w in seg.words:
+                    words.append({
+                        "start": w.start,
+                        "end": w.end,
+                        "word": w.word
+                    })
+
+        if not words:
+            raise RuntimeError("NO WORDS FROM WHISPER")
+
+        # ASS
+        generate_ass(words, subs_ass)
+
+        # BURN
+        run([
+            "ffmpeg", "-y",
+            "-i", input_mp4,
+            "-vf", f"ass={subs_ass}",
+            "-c:a", "copy",
+            output_mp4
+        ])
+
+        # R2 UPLOAD
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY,
+            aws_secret_access_key=R2_SECRET_KEY,
+            region_name="auto"
+        )
+
+        key = f"clips/{uuid.uuid4()}.mp4"
+        s3.upload_file(
+            output_mp4,
+            R2_BUCKET,
+            key,
+            ExtraArgs={"ContentType": "video/mp4"}
+        )
+
+        public_url = f"{R2_PUBLIC_BASE}/{key}"
+
+        return {
+            "video_url": public_url
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
 
 start({"handler": handler})
