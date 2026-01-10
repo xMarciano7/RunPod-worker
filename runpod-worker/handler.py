@@ -10,7 +10,7 @@ from faster_whisper import WhisperModel
 
 
 # ================= CONFIG =================
-WHISPER_MODEL = "tiny"
+WHISPER_MODEL = "medium"
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
 
