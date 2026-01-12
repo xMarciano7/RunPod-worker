@@ -38,7 +38,6 @@ def ts(t):
 
 
 def ass_color(hex_color: str):
-    # #RRGGBB -> &HAABBGGRR
     hex_color = hex_color.lstrip("#")
     r = hex_color[0:2]
     g = hex_color[2:4]
@@ -47,8 +46,6 @@ def ass_color(hex_color: str):
 
 
 def ass_alignment(alignment: str):
-    # ASS:
-    # 1 bottom-left | 2 bottom-center | 3 bottom-right
     if alignment == "left":
         return 1
     if alignment == "right":
@@ -56,22 +53,27 @@ def ass_alignment(alignment: str):
     return 2  # center
 
 
-def generate_ass(words, preset, path):
-    font = preset.get("font", "Poppins")
-    font_size = int(preset.get("fontSize", 96))
+def map_preset_to_ass(preset: dict):
+    # Escala web → ASS (ajustable)
+    font_size = int(preset["fontSize"] * 2)
 
-    text_color = ass_color(preset.get("color", "#FFFFFF"))
-    outline_color = ass_color(preset.get("outlineColor", "#000000"))
-    outline_size = int(preset.get("outlineThickness", 0))
-
-    alignment = preset.get("alignment", "center")
-    ass_align = ass_alignment(alignment)
-
-    # Vertical position (% → MarginV)
-    vertical_pct = int(preset.get("position", 50))
     play_res_y = 1920
-    margin_v = int((100 - vertical_pct) / 100 * play_res_y)
+    margin_v = int((100 - preset["verticalPosition"]) / 100 * play_res_y)
 
+    return {
+        "font": preset["fontFamily"],
+        "font_size": font_size,
+        "bold": 1 if preset["fontWeight"] == "bold" else 0,
+        "italic": 1 if preset["fontStyle"] == "italic" else 0,
+        "text_color": ass_color(preset["textColor"]),
+        "outline_color": ass_color(preset["outlineColor"]),
+        "outline_size": int(preset["outlineThickness"]),
+        "alignment": ass_alignment(preset["horizontalAlignment"]),
+        "margin_v": margin_v,
+    }
+
+
+def generate_ass(words, ass_preset, path):
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -79,7 +81,7 @@ PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font},{font_size},{text_color},{text_color},{outline_color},&H00000000,1,0,1,{outline_size},0,{ass_align},60,60,{margin_v},1
+Style: Default,{ass_preset['font']},{ass_preset['font_size']},{ass_preset['text_color']},{ass_preset['text_color']},{ass_preset['outline_color']},&H00000000,{ass_preset['bold']},{ass_preset['italic']},1,{ass_preset['outline_size']},0,{ass_preset['alignment']},60,60,{ass_preset['margin_v']},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -107,7 +109,9 @@ def handler(event):
         data = event["input"]
 
         youtube_url = data["youtube_url"]
-        preset = data.get("subtitle_preset", {})
+        preset = data["subtitle_preset"]
+
+        ass_preset = map_preset_to_ass(preset)
 
         tmp = tempfile.mkdtemp()
         input_mp4 = os.path.join(tmp, "input.mp4")
@@ -117,7 +121,6 @@ def handler(event):
 
         download_video(youtube_url, input_mp4)
 
-        # AUDIO
         run([
             "ffmpeg", "-y",
             "-i", input_mp4,
@@ -127,7 +130,6 @@ def handler(event):
             audio_wav
         ])
 
-        # WHISPER
         model = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
         segments, _ = model.transcribe(audio_wav, word_timestamps=True)
 
@@ -144,9 +146,8 @@ def handler(event):
         if not words:
             raise RuntimeError("NO WORDS FROM WHISPER")
 
-        generate_ass(words, preset, subs_ass)
+        generate_ass(words, ass_preset, subs_ass)
 
-        # VIDEO FINAL 9:16 + ASS
         run([
             "ffmpeg", "-y",
             "-i", input_mp4,
