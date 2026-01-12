@@ -106,7 +106,7 @@ def handler(event):
     try:
         data = event["input"]
 
-        video_url = data["video_url"]
+        youtube_url = data["youtube_url"]
         preset = data.get("subtitle_preset", {})
 
         tmp = tempfile.mkdtemp()
@@ -115,7 +115,7 @@ def handler(event):
         subs_ass = os.path.join(tmp, "subs.ass")
         output_mp4 = os.path.join(tmp, "output.mp4")
 
-        download_video(video_url, input_mp4)
+        download_video(youtube_url, input_mp4)
 
         # AUDIO
         run([
@@ -180,7 +180,7 @@ def handler(event):
 
         return {
             "status": "ok",
-            "video_url": f"{R2_PUBLIC_BASE}/{key}"
+            "youtube_url": f"{R2_PUBLIC_BASE}/{key}"
         }
 
     except Exception:
