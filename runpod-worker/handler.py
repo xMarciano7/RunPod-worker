@@ -13,9 +13,6 @@ from faster_whisper import WhisperModel
 WHISPER_MODEL = "medium"
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
-
-FONT_NAME = "Poppins ExtraBold"
-FONT_SIZE = 150
 MAX_DURATION = "75"
 
 R2_BUCKET = os.getenv("R2_BUCKET")
@@ -40,7 +37,41 @@ def ts(t):
     return f"{h}:{m:02d}:{s:05.2f}"
 
 
-def generate_ass(words, path):
+def ass_color(hex_color: str):
+    # #RRGGBB -> &HAABBGGRR
+    hex_color = hex_color.lstrip("#")
+    r = hex_color[0:2]
+    g = hex_color[2:4]
+    b = hex_color[4:6]
+    return f"&H00{b}{g}{r}"
+
+
+def ass_alignment(alignment: str):
+    # ASS:
+    # 1 bottom-left | 2 bottom-center | 3 bottom-right
+    if alignment == "left":
+        return 1
+    if alignment == "right":
+        return 3
+    return 2  # center
+
+
+def generate_ass(words, preset, path):
+    font = preset.get("font", "Poppins")
+    font_size = int(preset.get("fontSize", 96))
+
+    text_color = ass_color(preset.get("color", "#FFFFFF"))
+    outline_color = ass_color(preset.get("outlineColor", "#000000"))
+    outline_size = int(preset.get("outlineThickness", 0))
+
+    alignment = preset.get("alignment", "center")
+    ass_align = ass_alignment(alignment)
+
+    # Vertical position (% → MarginV)
+    vertical_pct = int(preset.get("position", 50))
+    play_res_y = 1920
+    margin_v = int((100 - vertical_pct) / 100 * play_res_y)
+
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -48,11 +79,12 @@ PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{FONT_NAME},{FONT_SIZE},&H0000FFFF,&H0000FFFF,&H00000000,&H00000000,1,0,1,6,0,2,60,60,800,1
+Style: Default,{font},{font_size},{text_color},{text_color},{outline_color},&H00000000,1,0,1,{outline_size},0,{ass_align},60,60,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+
     lines = []
     for w in words:
         lines.append(
@@ -72,7 +104,10 @@ def download_video(url, output_path):
 
 def handler(event):
     try:
-        video_url = event["input"]["video_url"]
+        data = event["input"]
+
+        video_url = data["video_url"]
+        preset = data.get("subtitle_preset", {})
 
         tmp = tempfile.mkdtemp()
         input_mp4 = os.path.join(tmp, "input.mp4")
@@ -81,9 +116,8 @@ def handler(event):
         output_mp4 = os.path.join(tmp, "output.mp4")
 
         download_video(video_url, input_mp4)
-        run(["ffprobe", "-v", "error", "-show_format", input_mp4])
 
-        # AUDIO (75s)
+        # AUDIO
         run([
             "ffmpeg", "-y",
             "-i", input_mp4,
@@ -101,14 +135,18 @@ def handler(event):
         for seg in segments:
             if seg.words:
                 for w in seg.words:
-                    words.append({"start": w.start, "end": w.end, "word": w.word})
+                    words.append({
+                        "start": w.start,
+                        "end": w.end,
+                        "word": w.word
+                    })
 
         if not words:
             raise RuntimeError("NO WORDS FROM WHISPER")
 
-        generate_ass(words, subs_ass)
+        generate_ass(words, preset, subs_ass)
 
-        # 🎬 VIDEO FINAL 9:16 BLUR
+        # VIDEO FINAL 9:16 + ASS
         run([
             "ffmpeg", "-y",
             "-i", input_mp4,
@@ -133,9 +171,17 @@ def handler(event):
         )
 
         key = f"clips/{uuid.uuid4()}.mp4"
-        s3.upload_file(output_mp4, R2_BUCKET, key, ExtraArgs={"ContentType": "video/mp4"})
+        s3.upload_file(
+            output_mp4,
+            R2_BUCKET,
+            key,
+            ExtraArgs={"ContentType": "video/mp4"}
+        )
 
-        return {"video_url": f"{R2_PUBLIC_BASE}/{key}"}
+        return {
+            "status": "ok",
+            "video_url": f"{R2_PUBLIC_BASE}/{key}"
+        }
 
     except Exception:
         print(traceback.format_exc())
